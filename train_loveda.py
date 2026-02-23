@@ -75,21 +75,33 @@ def colorize_mask(mask: np.ndarray, colors: np.ndarray, ignore_index: int) -> np
     return out
 
 
-def error_mask_wrong(gt: np.ndarray, pred: np.ndarray, ignore_index: int) -> np.ndarray:
-    wrong = (gt != ignore_index) & (gt != pred)
-    out = np.zeros((gt.shape[0], gt.shape[1], 3), dtype=np.uint8)
-    out[wrong] = np.array([255, 0, 255], dtype=np.uint8)
-    return out
+def error_heatmap_wrong(gt: np.ndarray, pred: np.ndarray, probs: np.ndarray, ignore_index: int) -> np.ndarray:
+    valid = gt != ignore_index
+    wrong = valid & (gt != pred)
+
+    h, w = gt.shape
+    yy, xx = np.indices((h, w))
+    gt_safe = gt.copy()
+    gt_safe[~valid] = 0
+    p_gt = probs[gt_safe, yy, xx]
+
+    heat = np.zeros((h, w), dtype=np.float32)
+    heat[wrong] = (1.0 - p_gt[wrong]).astype(np.float32)
+    return heat
 
 
-def error_mask_fpfn(gt: np.ndarray, pred: np.ndarray, ignore_index: int, background: int = 0) -> np.ndarray:
+def error_heatmap_fpfn(gt: np.ndarray, pred: np.ndarray, probs: np.ndarray, ignore_index: int, background: int = 0) -> np.ndarray:
     valid = gt != ignore_index
     fp = valid & (gt == background) & (pred != background)
     fn = valid & (gt != background) & (pred == background)
-    out = np.zeros((gt.shape[0], gt.shape[1], 3), dtype=np.uint8)
-    out[fp] = np.array([255, 165, 0], dtype=np.uint8)
-    out[fn] = np.array([0, 255, 255], dtype=np.uint8)
-    return out
+
+    prob_bg = probs[background].astype(np.float32)
+    prob_non_bg = (1.0 - prob_bg).astype(np.float32)
+
+    heat = np.zeros(gt.shape, dtype=np.float32)
+    heat[fp] = prob_non_bg[fp]
+    heat[fn] = -prob_bg[fn]
+    return heat
 
 
 def save_epoch_visuals(
@@ -118,6 +130,7 @@ def save_epoch_visuals(
         rgb = Image.open(pair.image_path).convert("RGB")
         gt_img = Image.open(pair.mask_path)
         gt = np.array(gt_img, dtype=np.int64)
+        gt[gt == 7] = ignore_index
 
         img_t, _ = ValTransform(ignore_index=ignore_index)(rgb, gt_img)
         img_t = img_t.to(device)
@@ -132,16 +145,18 @@ def save_epoch_visuals(
                 device=device,
                 amp=amp,
             )
-            pred = probs.argmax(dim=0).to(torch.int64).cpu().numpy()
+            probs_np = probs.to(torch.float32).cpu().numpy()
+            pred = probs_np.argmax(axis=0).astype(np.int64)
         else:
             with autocast(enabled=amp):
                 logits = forward_logits(model, img_t.unsqueeze(0))
-            pred = logits.argmax(dim=1).squeeze(0).to(torch.int64).cpu().numpy()
+            probs_np = torch.softmax(logits.squeeze(0), dim=0).to(torch.float32).cpu().numpy()
+            pred = probs_np.argmax(axis=0).astype(np.int64)
 
         gt_color = colorize_mask(gt, colors, ignore_index=ignore_index)
         pred_color = colorize_mask(pred, colors, ignore_index=ignore_index)
-        wrong = error_mask_wrong(gt, pred, ignore_index=ignore_index)
-        fpfn = error_mask_fpfn(gt, pred, ignore_index=ignore_index, background=0)
+        wrong_heat = error_heatmap_wrong(gt, pred, probs_np, ignore_index=ignore_index)
+        fpfn_heat = error_heatmap_fpfn(gt, pred, probs_np, ignore_index=ignore_index, background=0)
 
         fig = plt.figure(figsize=(12, 8), dpi=150)
         ax1 = fig.add_subplot(2, 3, 1)
@@ -160,20 +175,22 @@ def save_epoch_visuals(
         ax3.axis("off")
 
         ax4 = fig.add_subplot(2, 3, 4)
-        ax4.imshow(wrong)
-        ax4.set_title("error: wrong (magenta)")
+        ax4.imshow(wrong_heat, cmap="magma", vmin=0.0, vmax=1.0)
+        ax4.set_title("error heat: wrong (0..1)")
         ax4.axis("off")
 
         ax5 = fig.add_subplot(2, 3, 5)
-        ax5.imshow(fpfn)
-        ax5.set_title("error: fp/orange fn/cyan")
+        ax5.imshow(fpfn_heat, cmap="coolwarm", vmin=-1.0, vmax=1.0)
+        ax5.set_title("error heat: fp(+)/fn(-)")
         ax5.axis("off")
 
         ax6 = fig.add_subplot(2, 3, 6)
-        overlay = np.array(rgb, dtype=np.uint8).copy()
-        overlay[wrong[..., 0] > 0] = (0.6 * overlay[wrong[..., 0] > 0] + 0.4 * np.array([255, 0, 0], dtype=np.uint8)).astype(np.uint8)
+        overlay = np.array(rgb, dtype=np.float32).copy()
+        alpha = np.clip(wrong_heat, 0.0, 1.0) * 0.75
+        overlay[..., 0] = overlay[..., 0] * (1.0 - alpha) + 255.0 * alpha
+        overlay = np.clip(overlay, 0.0, 255.0).astype(np.uint8)
         ax6.imshow(overlay)
-        ax6.set_title("overlay wrong")
+        ax6.set_title("overlay wrong heat")
         ax6.axis("off")
 
         stem = pair.image_path.stem
@@ -181,8 +198,8 @@ def save_epoch_visuals(
         fig.savefig(out_dir / f"sample_{k:02d}_{stem}.png")
         plt.close(fig)
 
-        Image.fromarray(wrong, mode="RGB").save(out_dir / f"sample_{k:02d}_{stem}_error_wrong.png")
-        Image.fromarray(fpfn, mode="RGB").save(out_dir / f"sample_{k:02d}_{stem}_error_fpfn.png")
+        plt.imsave(out_dir / f"sample_{k:02d}_{stem}_error_wrong_heat.png", wrong_heat, cmap="magma", vmin=0.0, vmax=1.0)
+        plt.imsave(out_dir / f"sample_{k:02d}_{stem}_error_fpfn_heat.png", fpfn_heat, cmap="coolwarm", vmin=-1.0, vmax=1.0)
 
 
 @torch.no_grad()
@@ -349,7 +366,8 @@ def main() -> None:
     parser.add_argument("--max_val_batches", type=int, default=0)
     parser.add_argument("--vis", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--vis_dir", type=str, default="vis_loveda")
-    parser.add_argument("--vis_points", type=int, default=5)
+    parser.add_argument("--vis_every", type=int, default=15)
+    parser.add_argument("--vis_start", type=int, default=15)
     parser.add_argument("--vis_samples", type=int, default=5)
     args = parser.parse_args()
 
@@ -427,14 +445,6 @@ def main() -> None:
     total_steps = args.epochs * steps_per_epoch
     ce = nn.CrossEntropyLoss(ignore_index=args.ignore_index)
 
-    vis_epochs: set[int] = set()
-    if args.vis and args.vis_points > 0:
-        if args.epochs <= args.vis_points:
-            vis_epochs = set(range(args.epochs))
-        else:
-            xs = torch.linspace(0, args.epochs - 1, steps=args.vis_points).tolist()
-            vis_epochs = set(int(round(x)) for x in xs)
-
     vis_indices: list[int] = []
     if args.vis and args.vis_samples > 0:
         k = min(args.vis_samples, len(val_ds))
@@ -509,7 +519,13 @@ def main() -> None:
                 state = TrainState(epoch=state.epoch, step=state.step, best_miou=stats["miou"])
                 save_checkpoint(save_dir / "best.pt", model, optimizer, scaler, state)
 
-        if args.vis and vis_indices and epoch in vis_epochs:
+        if (
+            args.vis
+            and vis_indices
+            and args.vis_every > 0
+            and (epoch + 1) >= max(1, args.vis_start)
+            and ((epoch + 1 - args.vis_start) % args.vis_every == 0)
+        ):
             save_epoch_visuals(
                 model=model,
                 val_ds=val_ds,
