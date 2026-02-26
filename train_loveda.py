@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -47,31 +48,32 @@ def poly_lr(base_lr: float, step: int, total_steps: int, power: float = 0.9) -> 
     return base_lr * (1.0 - step / total_steps) ** power
 
 
+COLOR_MAP = OrderedDict(
+    Background=(255, 255, 255),
+    Building=(255, 0, 0),
+    Road=(255, 255, 0),
+    Water=(0, 0, 255),
+    Barren=(159, 129, 183),
+    Forest=(0, 255, 0),
+    Agricultural=(255, 195, 128),
+)
+
+
 def loveda_colors(num_classes: int) -> np.ndarray:
-    base = np.array(
-        [
-            [0, 0, 0],
-            [255, 0, 0],
-            [255, 255, 0],
-            [0, 0, 255],
-            [159, 129, 183],
-            [0, 255, 0],
-            [255, 195, 128],
-        ],
-        dtype=np.uint8,
-    )
+    base = np.array(list(COLOR_MAP.values()), dtype=np.uint8)
     if num_classes <= base.shape[0]:
-        return base[:num_classes]
+        return base[:num_classes].copy()
     extra = np.random.RandomState(0).randint(0, 255, size=(num_classes - base.shape[0], 3), dtype=np.uint8)
-    return np.concatenate([base, extra], axis=0)
+    return np.concatenate([base, extra], axis=0).copy()
 
 
-def colorize_mask(mask: np.ndarray, colors: np.ndarray, ignore_index: int) -> np.ndarray:
+def colorize_mask(mask: np.ndarray, colors: np.ndarray, ignore_index: int, ignore_color: tuple[int, int, int] = (0, 0, 0)) -> np.ndarray:
     h, w = mask.shape
     out = np.zeros((h, w, 3), dtype=np.uint8)
     valid = mask != ignore_index
     idx = np.clip(mask, 0, colors.shape[0] - 1)
     out[valid] = colors[idx[valid]]
+    out[~valid] = np.array(ignore_color, dtype=np.uint8)
     return out
 
 
@@ -125,6 +127,8 @@ def save_epoch_visuals(
     colors = loveda_colors(num_classes)
     model.eval()
 
+    rows: list[tuple[Image.Image, np.ndarray, np.ndarray, np.ndarray, np.ndarray, str]] = []
+
     for k, ds_idx in enumerate(vis_indices):
         pair = val_ds.pairs[ds_idx]
         rgb = Image.open(pair.image_path).convert("RGB")
@@ -158,6 +162,9 @@ def save_epoch_visuals(
         wrong_heat = error_heatmap_wrong(gt, pred, probs_np, ignore_index=ignore_index)
         fpfn_heat = error_heatmap_fpfn(gt, pred, probs_np, ignore_index=ignore_index, background=0)
 
+        stem = pair.image_path.stem
+        rows.append((rgb, gt_color, pred_color, wrong_heat, fpfn_heat, stem))
+
         fig = plt.figure(figsize=(12, 8), dpi=150)
         ax1 = fig.add_subplot(2, 3, 1)
         ax1.imshow(rgb)
@@ -175,12 +182,12 @@ def save_epoch_visuals(
         ax3.axis("off")
 
         ax4 = fig.add_subplot(2, 3, 4)
-        ax4.imshow(wrong_heat, cmap="magma", vmin=0.0, vmax=1.0)
+        ax4.imshow(wrong_heat, cmap="jet", vmin=0.0, vmax=1.0)
         ax4.set_title("error heat: wrong (0..1)")
         ax4.axis("off")
 
         ax5 = fig.add_subplot(2, 3, 5)
-        ax5.imshow(fpfn_heat, cmap="coolwarm", vmin=-1.0, vmax=1.0)
+        ax5.imshow(fpfn_heat, cmap="bwr", vmin=-1.0, vmax=1.0)
         ax5.set_title("error heat: fp(+)/fn(-)")
         ax5.axis("off")
 
@@ -193,13 +200,44 @@ def save_epoch_visuals(
         ax6.set_title("overlay wrong heat")
         ax6.axis("off")
 
-        stem = pair.image_path.stem
         fig.tight_layout()
         fig.savefig(out_dir / f"sample_{k:02d}_{stem}.png")
         plt.close(fig)
 
-        plt.imsave(out_dir / f"sample_{k:02d}_{stem}_error_wrong_heat.png", wrong_heat, cmap="magma", vmin=0.0, vmax=1.0)
-        plt.imsave(out_dir / f"sample_{k:02d}_{stem}_error_fpfn_heat.png", fpfn_heat, cmap="coolwarm", vmin=-1.0, vmax=1.0)
+        plt.imsave(out_dir / f"sample_{k:02d}_{stem}_error_wrong_heat.png", wrong_heat, cmap="jet", vmin=0.0, vmax=1.0)
+        plt.imsave(out_dir / f"sample_{k:02d}_{stem}_error_fpfn_heat.png", fpfn_heat, cmap="bwr", vmin=-1.0, vmax=1.0)
+
+    if rows:
+        fig = plt.figure(figsize=(18, 3.5 * len(rows)), dpi=150)
+        for r, (rgb, gt_color, pred_color, wrong_heat, fpfn_heat, stem) in enumerate(rows):
+            ax = fig.add_subplot(len(rows), 5, r * 5 + 1)
+            ax.imshow(rgb)
+            ax.set_title(f"image ({stem})")
+            ax.axis("off")
+
+            ax = fig.add_subplot(len(rows), 5, r * 5 + 2)
+            ax.imshow(gt_color)
+            ax.set_title("gt")
+            ax.axis("off")
+
+            ax = fig.add_subplot(len(rows), 5, r * 5 + 3)
+            ax.imshow(pred_color)
+            ax.set_title("pred")
+            ax.axis("off")
+
+            ax = fig.add_subplot(len(rows), 5, r * 5 + 4)
+            ax.imshow(wrong_heat, cmap="jet", vmin=0.0, vmax=1.0)
+            ax.set_title("wrong heat")
+            ax.axis("off")
+
+            ax = fig.add_subplot(len(rows), 5, r * 5 + 5)
+            ax.imshow(fpfn_heat, cmap="bwr", vmin=-1.0, vmax=1.0)
+            ax.set_title("fp/fn heat")
+            ax.axis("off")
+
+        fig.tight_layout()
+        fig.savefig(out_dir / "epoch_grid.png")
+        plt.close(fig)
 
 
 @torch.no_grad()
